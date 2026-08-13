@@ -3,7 +3,11 @@ import { RequirementInput, ComparisonResult } from '../types';
 import { SAMPLE_REQUIREMENTS } from '../data/sampleRequirements';
 import { BarChart3, ArrowRight, RefreshCw, AlertCircle, CheckCircle2, FileText, Sparkles } from 'lucide-react';
 
-export const SideBySideComparison: React.FC = () => {
+interface SideBySideComparisonProps {
+  apiKeys?: Record<string, string>;
+}
+
+export const SideBySideComparison: React.FC<SideBySideComparisonProps> = ({ apiKeys = {} }) => {
   const [comparisonType, setComparisonType] = useState<'prompt' | 'model'>('model');
   const [selectedSample, setSelectedSample] = useState<RequirementInput>(SAMPLE_REQUIREMENTS[0]);
   const [customText, setCustomText] = useState(SAMPLE_REQUIREMENTS[0].requirement_text);
@@ -34,6 +38,7 @@ export const SideBySideComparison: React.FC = () => {
             requirement_text: customText,
             model_a: modelA,
             model_b: modelB,
+            user_api_keys: apiKeys,
           }
         : {
             requirement_id: selectedSample.requirement_id,
@@ -41,6 +46,7 @@ export const SideBySideComparison: React.FC = () => {
             source_ref: selectedSample.source_ref,
             requirement_text: customText,
             model: modelA,
+            user_api_keys: apiKeys,
           };
 
       const response = await fetch('/api/compare-modes', {

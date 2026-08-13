@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import { buildPrompt, PROMPT_KIT } from "./src/data/prompts";
-import { GenerationMetrics, GenerationResult, ModelProvider, TestCase, TestGenerationResponse } from "./src/types";
+import { CategoryType, GenerationMetrics, GenerationResult, ModelProvider, TestCase, TestGenerationResponse } from "./src/types";
 
 dotenv.config();
 
@@ -12,6 +12,30 @@ const PORT = 3000;
 const app = express();
 
 app.use(express.json());
+
+const testCasesResponseSchema = {
+  type: Type.OBJECT,
+  properties: {
+    requirement_id: { type: Type.STRING },
+    domain: { type: Type.STRING },
+    test_cases: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          test_case_id: { type: Type.STRING },
+          category: { type: Type.STRING, enum: ['normal', 'boundary', 'negative'] },
+          given: { type: Type.STRING },
+          when: { type: Type.STRING },
+          then: { type: Type.STRING },
+          traceable_to: { type: Type.STRING },
+        },
+        required: ['test_case_id', 'category', 'given', 'when', 'then', 'traceable_to'],
+      },
+    },
+  },
+  required: ['requirement_id', 'domain', 'test_cases'],
+};
 
 // Initialize Gemini API client on the server
 const getAiClient = () => {
@@ -37,7 +61,7 @@ function getProviderFromModel(model: string): ModelProvider {
   return 'google';
 }
 
-// Unified multi-model execution dispatcher
+// Unified multi-model execution dispatcher (NO Silent Fallback)
 async function callModelAPI(
   model: string,
   prompt: string,
@@ -51,200 +75,177 @@ async function callModelAPI(
   // 1. OpenAI (ChatGPT)
   if (provider === 'openai') {
     const apiKey = userApiKeys?.openai || process.env.OPENAI_API_KEY;
-    if (apiKey) {
-      try {
-        const messages: any[] = [];
-        if (systemInstruction) messages.push({ role: 'system', content: systemInstruction });
-        messages.push({ role: 'user', content: prompt });
-        const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model,
-            messages,
-            temperature,
-            response_format: isBaseline ? undefined : { type: 'json_object' },
-          }),
-        });
-        if (resp.ok) {
-          const json: any = await resp.json();
-          const rawOutput = json.choices?.[0]?.message?.content || '';
-          return { rawOutput, provider: 'openai' };
-        }
-      } catch (e) {
-        console.warn("OpenAI API call error, falling back to Gemini engine:", e);
-      }
+    if (!apiKey) {
+      throw new Error(`OpenAI API key is not configured. Please configure OPENAI_API_KEY to run ${model}.`);
     }
+    const messages: any[] = [];
+    if (systemInstruction) messages.push({ role: 'system', content: systemInstruction });
+    messages.push({ role: 'user', content: prompt });
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature,
+        response_format: isBaseline ? undefined : { type: 'json_object' },
+      }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`OpenAI API request failed (HTTP ${resp.status}): ${errText}`);
+    }
+    const json: any = await resp.json();
+    const rawOutput = json.choices?.[0]?.message?.content || '';
+    if (!rawOutput) throw new Error("OpenAI returned an empty response.");
+    return { rawOutput, provider: 'openai' };
   }
 
   // 2. Anthropic (Claude)
   if (provider === 'anthropic') {
     const apiKey = userApiKeys?.anthropic || process.env.ANTHROPIC_API_KEY;
-    if (apiKey) {
-      try {
-        const resp = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01',
-          },
-          body: JSON.stringify({
-            model: model.includes('haiku') ? 'claude-3-5-haiku-20241022' : 'claude-3-5-sonnet-20241022',
-            system: systemInstruction,
-            messages: [{ role: 'user', content: prompt }],
-            max_tokens: 2048,
-            temperature,
-          }),
-        });
-        if (resp.ok) {
-          const json: any = await resp.json();
-          const rawOutput = json.content?.[0]?.text || '';
-          return { rawOutput, provider: 'anthropic' };
-        }
-      } catch (e) {
-        console.warn("Anthropic API call error, falling back to Gemini engine:", e);
-      }
+    if (!apiKey) {
+      throw new Error(`Anthropic API key is not configured. Please configure ANTHROPIC_API_KEY to run Claude.`);
     }
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: model.includes('haiku') ? 'claude-3-5-haiku-20241022' : 'claude-3-5-sonnet-20241022',
+        system: systemInstruction,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 2048,
+        temperature,
+      }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Anthropic API request failed (HTTP ${resp.status}): ${errText}`);
+    }
+    const json: any = await resp.json();
+    const rawOutput = json.content?.[0]?.text || '';
+    if (!rawOutput) throw new Error("Anthropic Claude returned an empty response.");
+    return { rawOutput, provider: 'anthropic' };
   }
 
   // 3. Perplexity (Sonar)
   if (provider === 'perplexity') {
     const apiKey = userApiKeys?.perplexity || process.env.PERPLEXITY_API_KEY;
-    if (apiKey) {
-      try {
-        const messages: any[] = [];
-        if (systemInstruction) messages.push({ role: 'system', content: systemInstruction });
-        messages.push({ role: 'user', content: prompt });
-        const resp = await fetch('https://api.perplexity.ai/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model: model.includes('reasoning') ? 'sonar-reasoning' : 'sonar',
-            messages,
-            temperature,
-          }),
-        });
-        if (resp.ok) {
-          const json: any = await resp.json();
-          const rawOutput = json.choices?.[0]?.message?.content || '';
-          return { rawOutput, provider: 'perplexity' };
-        }
-      } catch (e) {
-        console.warn("Perplexity API call error, falling back to Gemini engine:", e);
-      }
+    if (!apiKey) {
+      throw new Error(`Perplexity API key is not configured. Please configure PERPLEXITY_API_KEY to run ${model}.`);
     }
+    const messages: any[] = [];
+    if (systemInstruction) messages.push({ role: 'system', content: systemInstruction });
+    messages.push({ role: 'user', content: prompt });
+    const resp = await fetch('https://api.perplexity.ai/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: model.includes('reasoning') ? 'sonar-reasoning' : 'sonar',
+        messages,
+        temperature,
+      }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Perplexity API request failed (HTTP ${resp.status}): ${errText}`);
+    }
+    const json: any = await resp.json();
+    const rawOutput = json.choices?.[0]?.message?.content || '';
+    if (!rawOutput) throw new Error("Perplexity returned an empty response.");
+    return { rawOutput, provider: 'perplexity' };
   }
 
   // 4. xAI (Grok)
   if (provider === 'xai') {
     const apiKey = userApiKeys?.xai || process.env.XAI_API_KEY;
-    if (apiKey) {
-      try {
-        const messages: any[] = [];
-        if (systemInstruction) messages.push({ role: 'system', content: systemInstruction });
-        messages.push({ role: 'user', content: prompt });
-        const resp = await fetch('https://api.xai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model: model.includes('3') ? 'grok-3' : 'grok-2-latest',
-            messages,
-            temperature,
-          }),
-        });
-        if (resp.ok) {
-          const json: any = await resp.json();
-          const rawOutput = json.choices?.[0]?.message?.content || '';
-          return { rawOutput, provider: 'xai' };
-        }
-      } catch (e) {
-        console.warn("xAI API call error, falling back to Gemini engine:", e);
-      }
+    if (!apiKey) {
+      throw new Error(`xAI API key is not configured. Please configure XAI_API_KEY to run Grok.`);
     }
+    const messages: any[] = [];
+    if (systemInstruction) messages.push({ role: 'system', content: systemInstruction });
+    messages.push({ role: 'user', content: prompt });
+    const resp = await fetch('https://api.xai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: model.includes('3') ? 'grok-3' : 'grok-2-latest',
+        messages,
+        temperature,
+      }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`xAI API request failed (HTTP ${resp.status}): ${errText}`);
+    }
+    const json: any = await resp.json();
+    const rawOutput = json.choices?.[0]?.message?.content || '';
+    if (!rawOutput) throw new Error("xAI Grok returned an empty response.");
+    return { rawOutput, provider: 'xai' };
   }
 
-  // 5. Fallback or Google Gemini
-  const ai = getAiClient();
+  // 5. Google Gemini
+  const apiKey = userApiKeys?.google || process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error("Google Gemini API key is not configured. Please configure GEMINI_API_KEY.");
+  }
+  const ai = new GoogleGenAI({ apiKey, httpOptions: { headers: { "User-Agent": "aistudio-build" } } });
   const targetGeminiModel = model.includes('pro') ? 'gemini-3.1-pro-preview' : 'gemini-3.6-flash';
-
-  let adjustedSystem = systemInstruction;
-  if (provider !== 'google') {
-    const providerTag =
-      provider === 'openai'
-        ? 'OpenAI ChatGPT'
-        : provider === 'anthropic'
-        ? 'Anthropic Claude 3.5'
-        : provider === 'perplexity'
-        ? 'Perplexity Sonar Reasoning'
-        : 'xAI Grok-3';
-    adjustedSystem = `[Multi-Model Engine Persona: ${providerTag} (${model})]\n${systemInstruction || ''}`;
-  }
 
   if (isBaseline) {
     const response = await ai.models.generateContent({
       model: targetGeminiModel,
       contents: prompt,
       config: {
-        systemInstruction: adjustedSystem,
+        systemInstruction,
         temperature: typeof temperature === 'number' ? temperature : 0.7,
       },
     });
-    return { rawOutput: response.text || '', provider };
+    return { rawOutput: response.text || '', provider: 'google' };
   } else {
     const response = await ai.models.generateContent({
       model: targetGeminiModel,
       contents: prompt,
       config: {
-        systemInstruction: adjustedSystem,
+        systemInstruction,
         temperature: typeof temperature === 'number' ? temperature : 0.2,
         responseMimeType: 'application/json',
         responseSchema: testCasesResponseSchema,
       },
     });
-    return { rawOutput: response.text || '', provider };
+    return { rawOutput: response.text || '', provider: 'google' };
   }
 }
 
 
-// Response schema for structured JSON output
-const testCasesResponseSchema = {
-  type: Type.OBJECT,
-  properties: {
-    requirement_id: { type: Type.STRING, description: "Requirement ID being verified" },
-    domain: { type: Type.STRING, description: "System or software domain" },
-    test_cases: {
-      type: Type.ARRAY,
-      description: "List of Given-When-Then test cases",
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          test_case_id: { type: Type.STRING, description: "Unique identifier (e.g. TC-REQ-01)" },
-          category: { type: Type.STRING, description: "Must be 'normal', 'boundary', or 'negative'" },
-          given: { type: Type.STRING, description: "Precondition state" },
-          when: { type: Type.STRING, description: "Stimulus or trigger action" },
-          then: { type: Type.STRING, description: "Expected output or system behavior" },
-          traceable_to: { type: Type.STRING, description: "Requirement ID reference" },
-        },
-        required: ["test_case_id", "category", "given", "when", "then", "traceable_to"],
-      },
-    },
-  },
-  required: ["requirement_id", "domain", "test_cases"],
-};
 
-// Helper to compute metrics from generated test cases
+// Helper to extract testable requirement clause conditions
+function extractRequirementClauses(requirementText: string): string[] {
+  if (!requirementText) return [];
+  const rawParts = requirementText
+    .split(/(?:\.|\;|\n|\bshall\b|\bmust\b|\bif\b|\bwhen\b|\bunless\b|\bprovided that\b)/i)
+    .map(p => p.trim())
+    .filter(p => p.length > 8);
+  return rawParts.length > 0 ? rawParts : [requirementText.trim()];
+}
+
+// Helper to compute rigorous research evaluation metrics from generated test cases
 function computeMetrics(
   requirementId: string,
+  requirementText: string,
   parsedData: any,
   rawOutput: string,
   latencyMs: number,
@@ -255,34 +256,103 @@ function computeMetrics(
   let boundary = 0;
   let negative = 0;
   let schemaConformance = false;
-  let traceabilityValid = true;
+  let schemaConformanceReason: string | undefined = undefined;
   let validTestCases: TestCase[] = [];
+  let atomicCount = 0;
+  let nonAtomicCount = 0;
+  let traceableCount = 0;
 
   if (parsedData && Array.isArray(parsedData.test_cases)) {
-    schemaConformance = true;
     totalTestCases = parsedData.test_cases.length;
+    let hasValidationFailure = false;
+    const failureReasons: string[] = [];
+
+    if (totalTestCases === 0) {
+      hasValidationFailure = true;
+      failureReasons.push("Response contains an empty 'test_cases' array.");
+    }
 
     parsedData.test_cases.forEach((tc: any, index: number) => {
-      const cat = (tc.category || '').toLowerCase();
-      if (cat.includes('boundary')) boundary++;
-      else if (cat.includes('negative') || cat.includes('error')) negative++;
+      // Required fields validation
+      const missingFields: string[] = [];
+      if (!tc.given || typeof tc.given !== 'string' || !tc.given.trim()) missingFields.push('given');
+      if (!tc.when || typeof tc.when !== 'string' || !tc.when.trim()) missingFields.push('when');
+      if (!tc.then || typeof tc.then !== 'string' || !tc.then.trim()) missingFields.push('then');
+      if (!tc.test_case_id) missingFields.push('test_case_id');
+      if (!tc.traceable_to) missingFields.push('traceable_to');
+
+      const catRaw = (tc.category || '').toLowerCase();
+      let normalizedCat: CategoryType = 'normal';
+      if (catRaw.includes('boundary') || catRaw.includes('edge') || catRaw.includes('limit')) {
+        normalizedCat = 'boundary';
+      } else if (catRaw.includes('negative') || catRaw.includes('error') || catRaw.includes('invalid') || catRaw.includes('fail')) {
+        normalizedCat = 'negative';
+      } else if (catRaw.includes('normal') || catRaw.includes('positive') || catRaw.includes('valid') || catRaw.includes('standard')) {
+        normalizedCat = 'normal';
+      } else if (catRaw !== '') {
+        missingFields.push(`invalid category '${tc.category}'`);
+      }
+
+      if (missingFields.length > 0) {
+        hasValidationFailure = true;
+        failureReasons.push(`Test case #${index + 1} issue: missing ${missingFields.join(', ')}.`);
+      }
+
+      // Count categories
+      if (normalizedCat === 'boundary') boundary++;
+      else if (normalizedCat === 'negative') negative++;
       else normal++;
 
-      if (tc.traceable_to && tc.traceable_to !== requirementId && tc.traceable_to !== parsedData.requirement_id) {
-        traceabilityValid = false;
+      // Traceability check
+      const tcTrace = String(tc.traceable_to || '').trim();
+      const reqIdClean = String(requirementId || '').trim();
+      const parsedReqClean = String(parsedData.requirement_id || '').trim();
+      if (tcTrace && (tcTrace.toLowerCase().includes(reqIdClean.toLowerCase()) || tcTrace.toLowerCase().includes(parsedReqClean.toLowerCase()) || reqIdClean.toLowerCase().includes(tcTrace.toLowerCase()))) {
+        traceableCount++;
+      }
+
+      // Atomicity Heuristic check
+      const whenText = (tc.when || '').toLowerCase();
+      const thenText = (tc.then || '').toLowerCase();
+      const compoundPatterns = [
+        /\band then\b/,
+        /\band also\b/,
+        /\badditionally\b/,
+        /\bplus\b/,
+        /\b\.\s+[a-z]/,
+        /;\s+/,
+        /\b(and|then)\s+.*\b(and|then)\b/
+      ];
+      const isCompoundWhen = compoundPatterns.some(p => p.test(whenText));
+      const isCompoundThen = compoundPatterns.some(p => p.test(thenText));
+
+      if (isCompoundWhen || isCompoundThen) {
+        nonAtomicCount++;
+      } else {
+        atomicCount++;
       }
 
       validTestCases.push({
         test_case_id: tc.test_case_id || `TC-${requirementId}-${String(index + 1).padStart(2, '0')}`,
-        category: (cat.includes('boundary') ? 'boundary' : cat.includes('negative') ? 'negative' : 'normal') as any,
+        category: normalizedCat,
         given: tc.given || '',
         when: tc.when || '',
         then: tc.then || '',
         traceable_to: tc.traceable_to || requirementId,
       });
     });
+
+    if (!hasValidationFailure) {
+      schemaConformance = true;
+    } else {
+      schemaConformance = false;
+      schemaConformanceReason = failureReasons.slice(0, 2).join(" ");
+    }
   } else if (isBaseline) {
-    // Attempt fallback heuristic extraction from unstructured text
+    schemaConformance = false;
+    schemaConformanceReason = "Baseline mode generates unstructured text without JSON schema conformance.";
+
+    // Attempt heuristic extraction for baseline text
     const lines = rawOutput.split("\n");
     let currentTc: Partial<TestCase> = {};
     lines.forEach((line) => {
@@ -327,18 +397,53 @@ function computeMetrics(
       if (tc.category === 'boundary') boundary++;
       else if (tc.category === 'negative') negative++;
       else normal++;
+      traceableCount++;
+      atomicCount++;
     });
+  } else {
+    schemaConformance = false;
+    schemaConformanceReason = "Failed to parse model response as valid JSON schema.";
   }
 
   const hasNormal = normal > 0;
   const hasBoundary = boundary > 0;
   const hasNegative = negative > 0;
 
-  // Coverage score out of 100% based on paper's 3 category criteria
-  let coverageScore = 0;
-  if (hasNormal) coverageScore += 34;
-  if (hasBoundary) coverageScore += 33;
-  if (hasNegative) coverageScore += 33;
+  // 1. Test Category Coverage (TCC %)
+  let testCategoryCoverage = 0;
+  if (hasNormal) testCategoryCoverage += 34;
+  if (hasBoundary) testCategoryCoverage += 33;
+  if (hasNegative) testCategoryCoverage += 33;
+
+  // 2. Requirement Clause Coverage (RCC %)
+  const reqClauses = extractRequirementClauses(requirementText);
+  const totalRequirementClauses = reqClauses.length;
+  let coveredRequirementClauses = 0;
+
+  if (totalRequirementClauses > 0 && totalTestCases > 0) {
+    const combinedTcText = validTestCases.map(tc => `${tc.given} ${tc.when} ${tc.then}`).join(" ").toLowerCase();
+    reqClauses.forEach(clause => {
+      const keywords = clause.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 3);
+      if (keywords.length === 0) {
+        coveredRequirementClauses++;
+      } else {
+        const matchCount = keywords.filter(kw => combinedTcText.includes(kw)).length;
+        if (matchCount >= Math.min(2, keywords.length)) {
+          coveredRequirementClauses++;
+        }
+      }
+    });
+  }
+  const requirementClauseCoverage = totalRequirementClauses > 0
+    ? Math.round((coveredRequirementClauses / totalRequirementClauses) * 100)
+    : 100;
+
+  // 3. Atomicity Heuristic %
+  const atomicityHeuristicScore = totalTestCases > 0 ? Math.round((atomicCount / totalTestCases) * 100) : 0;
+
+  // 4. Traceability %
+  const traceabilityScore = totalTestCases > 0 ? Math.round((traceableCount / totalTestCases) * 100) : 0;
+  const traceabilityValid = totalTestCases > 0 && traceableCount === totalTestCases;
 
   const metrics: GenerationMetrics = {
     totalTestCases,
@@ -346,10 +451,20 @@ function computeMetrics(
     hasNormal,
     hasBoundary,
     hasNegative,
-    coverageScore,
-    atomicityCheck: totalTestCases > 0 ? 'passed' : 'warning',
+    testCategoryCoverage,
+    totalRequirementClauses,
+    coveredRequirementClauses,
+    requirementClauseCoverage,
+    coverageScore: testCategoryCoverage,
+    atomicCount,
+    nonAtomicCount,
+    atomicityHeuristicScore,
+    atomicityCheck: atomicityHeuristicScore >= 80 ? 'passed' : 'warning',
+    traceableCount,
+    traceabilityScore,
     traceabilityValid,
     schemaConformance,
+    schemaConformanceReason,
     latencyMs,
     rawText: rawOutput,
   };
@@ -366,31 +481,34 @@ function computeMetrics(
 // API endpoint to generate test cases
 app.post("/api/generate-test-cases", async (req, res) => {
   const startTime = Date.now();
+  const {
+    requirement_id = "REQ-001",
+    domain = "Mozilla",
+    source_ref = "Ref-1",
+    requirement_text = "",
+    prompt_mode = "few-shot",
+    model = "gemini-3.6-flash",
+    temperature = 0.2,
+    user_api_keys = {},
+  } = req.body;
+
+  const provider = getProviderFromModel(model);
+
+  if (!requirement_text || typeof requirement_text !== "string" || !requirement_text.trim()) {
+    return res.status(400).json({ error: "requirement_text is required." });
+  }
+
+  const { prompt, systemInstruction } = buildPrompt(prompt_mode, {
+    requirement_id,
+    domain,
+    source_ref,
+    requirement_text,
+  });
+
+  const isBaseline = prompt_mode === "baseline";
+
   try {
-    const {
-      requirement_id = "REQ-001",
-      domain = "Mozilla",
-      source_ref = "Ref-1",
-      requirement_text = "",
-      prompt_mode = "few-shot",
-      model = "gemini-3.6-flash",
-      temperature = 0.2,
-      user_api_keys = {},
-    } = req.body;
-
-    if (!requirement_text || typeof requirement_text !== "string" || !requirement_text.trim()) {
-      return res.status(400).json({ error: "requirement_text is required." });
-    }
-
-    const { prompt, systemInstruction } = buildPrompt(prompt_mode, {
-      requirement_id,
-      domain,
-      source_ref,
-      requirement_text,
-    });
-
-    const isBaseline = prompt_mode === "baseline";
-    const { rawOutput, provider } = await callModelAPI(
+    const { rawOutput } = await callModelAPI(
       model,
       prompt,
       systemInstruction,
@@ -410,6 +528,7 @@ app.post("/api/generate-test-cases", async (req, res) => {
     const latencyMs = Date.now() - startTime;
     const { metrics, parsedResponse } = computeMetrics(
       requirement_id,
+      requirement_text,
       parsedData,
       rawOutput,
       latencyMs,
@@ -426,19 +545,146 @@ app.post("/api/generate-test-cases", async (req, res) => {
       mode: prompt_mode,
       model,
       provider,
+      temperature,
       timestamp: new Date().toISOString(),
+      requirement_id,
     };
 
     return res.json(result);
   } catch (error: any) {
-    console.error("Error in /api/generate-test-cases:", error);
     const latencyMs = Date.now() - startTime;
-    return res.status(500).json({
-      error: error.message || "Failed to generate test cases.",
+    const errorMsg = error.message || "Model execution failed.";
+    const failedMetrics: GenerationMetrics = {
+      totalTestCases: 0,
+      categoryCount: { normal: 0, boundary: 0, negative: 0 },
+      hasNormal: false,
+      hasBoundary: false,
+      hasNegative: false,
+      testCategoryCoverage: 0,
+      totalRequirementClauses: 0,
+      coveredRequirementClauses: 0,
+      requirementClauseCoverage: 0,
+      coverageScore: 0,
+      atomicCount: 0,
+      nonAtomicCount: 0,
+      atomicityHeuristicScore: 0,
+      atomicityCheck: 'warning',
+      traceableCount: 0,
+      traceabilityScore: 0,
+      traceabilityValid: false,
+      schemaConformance: false,
+      schemaConformanceReason: `Execution Error: ${errorMsg}`,
       latencyMs,
-    });
+      error: errorMsg,
+    };
+
+    const failedResult: GenerationResult = {
+      success: false,
+      error: errorMsg,
+      data: { requirement_id, domain, test_cases: [] },
+      rawOutput: `EXECUTION FAILED: ${errorMsg}`,
+      metrics: failedMetrics,
+      promptUsed: prompt,
+      systemInstructionUsed: systemInstruction,
+      mode: prompt_mode,
+      model,
+      provider,
+      temperature,
+      timestamp: new Date().toISOString(),
+      requirement_id,
+    };
+
+    return res.json(failedResult);
   }
 });
+
+// Helper for safe individual model run in comparison / benchmark endpoints
+async function runSingleModelExperiment(
+  model: string,
+  promptMode: 'few-shot' | 'zero-shot' | 'baseline',
+  input: { requirement_id: string; domain: string; source_ref: string; requirement_text: string },
+  temperature: number = 0.2,
+  userApiKeys: Record<string, string> = {}
+): Promise<GenerationResult> {
+  const startTime = Date.now();
+  const provider = getProviderFromModel(model);
+  const { prompt, systemInstruction } = buildPrompt(promptMode, input);
+  const isBaseline = promptMode === 'baseline';
+
+  try {
+    const apiRes = await callModelAPI(model, prompt, systemInstruction, temperature, isBaseline, userApiKeys);
+    const latencyMs = Date.now() - startTime;
+
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(apiRes.rawOutput.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim());
+    } catch {}
+
+    const { metrics, parsedResponse } = computeMetrics(
+      input.requirement_id,
+      input.requirement_text,
+      parsed,
+      apiRes.rawOutput,
+      latencyMs,
+      isBaseline
+    );
+
+    return {
+      success: true,
+      data: parsedResponse,
+      rawOutput: apiRes.rawOutput,
+      metrics,
+      promptUsed: prompt,
+      systemInstructionUsed: systemInstruction,
+      mode: promptMode,
+      model,
+      provider,
+      temperature,
+      timestamp: new Date().toISOString(),
+      requirement_id: input.requirement_id,
+    };
+  } catch (err: any) {
+    const latencyMs = Date.now() - startTime;
+    const errorMsg = err.message || "Execution failed.";
+    return {
+      success: false,
+      error: errorMsg,
+      data: { requirement_id: input.requirement_id, domain: input.domain, test_cases: [] },
+      rawOutput: `EXECUTION FAILED: ${errorMsg}`,
+      metrics: {
+        totalTestCases: 0,
+        categoryCount: { normal: 0, boundary: 0, negative: 0 },
+        hasNormal: false,
+        hasBoundary: false,
+        hasNegative: false,
+        testCategoryCoverage: 0,
+        totalRequirementClauses: 0,
+        coveredRequirementClauses: 0,
+        requirementClauseCoverage: 0,
+        coverageScore: 0,
+        atomicCount: 0,
+        nonAtomicCount: 0,
+        atomicityHeuristicScore: 0,
+        atomicityCheck: 'warning',
+        traceableCount: 0,
+        traceabilityScore: 0,
+        traceabilityValid: false,
+        schemaConformance: false,
+        schemaConformanceReason: `Execution Error: ${errorMsg}`,
+        latencyMs,
+        error: errorMsg,
+      },
+      promptUsed: prompt,
+      systemInstructionUsed: systemInstruction,
+      mode: promptMode,
+      model,
+      provider,
+      temperature,
+      timestamp: new Date().toISOString(),
+      requirement_id: input.requirement_id,
+    };
+  }
+}
 
 // API endpoint for Side-by-Side Comparison
 app.post("/api/compare-modes", async (req, res) => {
@@ -458,111 +704,80 @@ app.post("/api/compare-modes", async (req, res) => {
       return res.status(400).json({ error: "requirement_text is required for comparison." });
     }
 
+    const reqInput = { requirement_id, domain, source_ref, requirement_text };
     const modelAToUse = model_a || model;
     const modelBToUse = model_b || "gpt-4o";
 
-    // Compare Model A vs Model B (or Baseline vs Few-Shot if same model)
+    // Cross-Model Comparison
     if (model_a && model_b && model_a !== model_b) {
-      // Direct Cross-Model Comparison
-      const promptObj = buildPrompt("few-shot", { requirement_id, domain, source_ref, requirement_text });
-
-      const startA = Date.now();
-      const resA = await callModelAPI(modelAToUse, promptObj.prompt, promptObj.systemInstruction, 0.2, false, user_api_keys);
-      const latencyA = Date.now() - startA;
-      let parsedA: any = null;
-      try { parsedA = JSON.parse(resA.rawOutput.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim()); } catch {}
-      const metricsA = computeMetrics(requirement_id, parsedA, resA.rawOutput, latencyA, false);
-
-      const startB = Date.now();
-      const resB = await callModelAPI(modelBToUse, promptObj.prompt, promptObj.systemInstruction, 0.2, false, user_api_keys);
-      const latencyB = Date.now() - startB;
-      let parsedB: any = null;
-      try { parsedB = JSON.parse(resB.rawOutput.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim()); } catch {}
-      const metricsB = computeMetrics(requirement_id, parsedB, resB.rawOutput, latencyB, false);
+      const resA = await runSingleModelExperiment(modelAToUse, "few-shot", reqInput, 0.2, user_api_keys);
+      const resB = await runSingleModelExperiment(modelBToUse, "few-shot", reqInput, 0.2, user_api_keys);
 
       return res.json({
-        requirement: { requirement_id, domain, source_ref, requirement_text },
-        modelAResult: {
-          success: true,
-          data: metricsA.parsedResponse,
-          rawOutput: resA.rawOutput,
-          metrics: metricsA.metrics,
-          promptUsed: promptObj.prompt,
-          systemInstructionUsed: promptObj.systemInstruction,
-          mode: "few-shot",
-          model: modelAToUse,
-          provider: resA.provider,
-          timestamp: new Date().toISOString(),
-        },
-        modelBResult: {
-          success: true,
-          data: metricsB.parsedResponse,
-          rawOutput: resB.rawOutput,
-          metrics: metricsB.metrics,
-          promptUsed: promptObj.prompt,
-          systemInstructionUsed: promptObj.systemInstruction,
-          mode: "few-shot",
-          model: modelBToUse,
-          provider: resB.provider,
-          timestamp: new Date().toISOString(),
-        },
+        requirement: reqInput,
+        modelAResult: resA,
+        modelBResult: resB,
       });
     }
 
-    // Default: Mode Comparison (Baseline Unstructured vs Few-Shot Prompt Kit)
-    const baselinePromptObj = buildPrompt("baseline", { requirement_id, domain, source_ref, requirement_text });
-    const startBaseline = Date.now();
-    const baselineRes = await callModelAPI(modelAToUse, baselinePromptObj.prompt, undefined, 0.7, true, user_api_keys);
-    const baselineLatency = Date.now() - startBaseline;
-
-    let baselineParsed: any = null;
-    try {
-      baselineParsed = JSON.parse(baselineRes.rawOutput.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim());
-    } catch {}
-    const baselineMetrics = computeMetrics(requirement_id, baselineParsed, baselineRes.rawOutput, baselineLatency, true);
-
-    const fewShotPromptObj = buildPrompt("few-shot", { requirement_id, domain, source_ref, requirement_text });
-    const startFewShot = Date.now();
-    const fewShotRes = await callModelAPI(modelAToUse, fewShotPromptObj.prompt, fewShotPromptObj.systemInstruction, 0.2, false, user_api_keys);
-    const fewShotLatency = Date.now() - startFewShot;
-
-    let fewShotParsed: any = null;
-    try {
-      fewShotParsed = JSON.parse(fewShotRes.rawOutput.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim());
-    } catch {}
-    const fewShotMetrics = computeMetrics(requirement_id, fewShotParsed, fewShotRes.rawOutput, fewShotLatency, false);
+    // Default: Prompt Mode Comparison (Baseline vs Few-Shot for single model)
+    const baselineResult = await runSingleModelExperiment(modelAToUse, "baseline", reqInput, 0.7, user_api_keys);
+    const fewShotResult = await runSingleModelExperiment(modelAToUse, "few-shot", reqInput, 0.2, user_api_keys);
 
     return res.json({
-      requirement: { requirement_id, domain, source_ref, requirement_text },
-      baselineResult: {
-        success: true,
-        data: baselineMetrics.parsedResponse,
-        rawOutput: baselineRes.rawOutput,
-        metrics: baselineMetrics.metrics,
-        promptUsed: baselinePromptObj.prompt,
-        mode: "baseline",
-        model: modelAToUse,
-        provider: baselineRes.provider,
-        timestamp: new Date().toISOString(),
-      },
-      fewShotResult: {
-        success: true,
-        data: fewShotMetrics.parsedResponse,
-        rawOutput: fewShotRes.rawOutput,
-        metrics: fewShotMetrics.metrics,
-        promptUsed: fewShotPromptObj.prompt,
-        systemInstructionUsed: fewShotPromptObj.systemInstruction,
-        mode: "few-shot",
-        model: modelAToUse,
-        provider: fewShotRes.provider,
-        timestamp: new Date().toISOString(),
-      },
+      requirement: reqInput,
+      baselineResult,
+      fewShotResult,
     });
   } catch (error: any) {
     console.error("Error in /api/compare-modes:", error);
     return res.status(500).json({ error: error.message || "Failed to complete comparison." });
   }
 });
+
+// API endpoint for Multi-Model Accuracy Benchmark Matrix
+app.post("/api/benchmark-models", async (req, res) => {
+  try {
+    const {
+      requirement_id = "REQ-BENCHMARK",
+      domain = "Cross-Domain",
+      source_ref = "SpecRef-01",
+      requirement_text = "",
+      models = [
+        "gemini-3.6-flash",
+        "gemini-3.1-pro-preview",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o3-mini",
+        "claude-3-5-sonnet",
+        "claude-3-5-haiku",
+        "sonar-reasoning",
+        "grok-3",
+      ],
+      user_api_keys = {},
+    } = req.body;
+
+    if (!requirement_text.trim()) {
+      return res.status(400).json({ error: "requirement_text is required for model benchmark." });
+    }
+
+    const reqInput = { requirement_id, domain, source_ref, requirement_text };
+    const benchmarkResults: Record<string, GenerationResult> = {};
+
+    for (const modelId of models) {
+      benchmarkResults[modelId] = await runSingleModelExperiment(modelId, "few-shot", reqInput, 0.2, user_api_keys);
+    }
+
+    return res.json({
+      requirement: reqInput,
+      results: benchmarkResults,
+    });
+  } catch (error: any) {
+    console.error("Error in /api/benchmark-models:", error);
+    return res.status(500).json({ error: error.message || "Failed to execute model accuracy benchmark." });
+  }
+});
+
 
 
 // Setup Vite in Dev or Static files in Production

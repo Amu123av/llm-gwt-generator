@@ -39,10 +39,20 @@ export interface GenerationMetrics {
   hasNormal: boolean;
   hasBoundary: boolean;
   hasNegative: boolean;
-  coverageScore: number; // 0 to 100%
+  testCategoryCoverage: number; // 0 to 100% (TCC)
+  totalRequirementClauses: number;
+  coveredRequirementClauses: number;
+  requirementClauseCoverage: number; // 0 to 100% (RCC)
+  coverageScore: number; // TCC (0 to 100%)
+  atomicCount: number;
+  nonAtomicCount: number;
+  atomicityHeuristicScore: number; // 0 to 100%
   atomicityCheck: 'passed' | 'warning';
+  traceableCount: number;
+  traceabilityScore: number; // 0 to 100%
   traceabilityValid: boolean;
   schemaConformance: boolean;
+  schemaConformanceReason?: string;
   latencyMs: number;
   rawText?: string;
   error?: string;
@@ -50,6 +60,7 @@ export interface GenerationMetrics {
 
 export interface GenerationResult {
   success: boolean;
+  error?: string;
   data?: TestGenerationResponse;
   rawOutput: string;
   metrics: GenerationMetrics;
@@ -57,8 +68,11 @@ export interface GenerationResult {
   systemInstructionUsed?: string;
   mode: PromptMode;
   model: string;
-  provider?: ModelProvider;
+  modelName?: string;
+  provider: ModelProvider;
+  temperature: number;
   timestamp: string;
+  requirement_id: string;
 }
 
 export interface RequirementInput {
@@ -83,4 +97,28 @@ export interface ComparisonResult {
   modelBResult?: GenerationResult;
   timestamp: string;
 }
+
+export interface ExperimentExportRow {
+  requirement_id: string;
+  domain: string;
+  source_ref: string;
+  model_provider: string;
+  model_name: string;
+  prompt_mode: string;
+  temperature: number;
+  test_case_id: string;
+  category: string;
+  given: string;
+  when: string;
+  then: string;
+  traceability: string; // e.g. "100%" or "Traceable"
+  schema_conformance: string; // "PASS" | "FAIL"
+  test_category_coverage: number; // %
+  atomicity_heuristic: number; // %
+  latency_ms: number;
+  timestamp: string;
+  execution_status: string; // "SUCCESS" | "FAILED"
+  error_message?: string;
+}
+
 

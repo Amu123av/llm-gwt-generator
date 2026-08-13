@@ -3,7 +3,11 @@ import { SAMPLE_REQUIREMENTS } from '../data/sampleRequirements';
 import { GenerationResult } from '../types';
 import { Layers, Play, RefreshCw, CheckCircle2, AlertTriangle, BarChart3, ArrowRight } from 'lucide-react';
 
-export const BatchSimulator: React.FC = () => {
+interface BatchSimulatorProps {
+  apiKeys?: Record<string, string>;
+}
+
+export const BatchSimulator: React.FC<BatchSimulatorProps> = ({ apiKeys = {} }) => {
   const [selectedModel, setSelectedModel] = useState<string>('gemini-3.6-flash');
   const [batchResults, setBatchResults] = useState<{ [reqId: string]: GenerationResult }>({});
   const [isRunning, setIsRunning] = useState(false);
@@ -31,6 +35,7 @@ export const BatchSimulator: React.FC = () => {
             prompt_mode: 'few-shot',
             model: selectedModel,
             temperature: 0.2,
+            user_api_keys: apiKeys,
           }),
         });
 
