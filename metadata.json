@@ -1,0 +1,6 @@
+{
+  "name": "Requirement-to-Test-Case Generator",
+  "description": "LLM-assisted Given-When-Then test case generation workbench using Google AI Studio prompt engineering framework and Gemini API.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
